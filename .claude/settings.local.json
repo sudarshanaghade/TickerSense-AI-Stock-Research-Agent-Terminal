@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(python app.py)",
+      "Bash(npm start:*)",
+      "Bash(python -c ':*)",
+      "Bash(timeout 30 python -c ':*)"
+    ]
+  }
+}
