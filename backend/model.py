@@ -105,8 +105,7 @@ def train_and_predict_lr(df, days=10):
         df.columns = df.columns.get_level_values(0)
 
     look_back = 10
-    X_train_sc, X_test_sc, y_train, y_test, scaler_X, scaler_y, split_idx, close = \
-        _build_features(df, look_back)
+    X_train_sc, y_train, scaler_X, close = _build_features(df, look_back)
 
     model = LinearRegression()
     model.fit(X_train_sc, y_train)
@@ -134,8 +133,7 @@ def train_and_predict_rf(df, days=10):
         df.columns = df.columns.get_level_values(0)
 
     look_back = 10
-    X_train_sc, X_test_sc, y_train, y_test, scaler_X, scaler_y, split_idx, close = \
-        _build_features(df, look_back)
+    X_train_sc, y_train, scaler_X, close = _build_features(df, look_back)
 
     model = RandomForestRegressor(
         n_estimators=200,

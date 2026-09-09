@@ -1,19 +1,16 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import Prediction from "./pages/Prediction";
-import Analysis from "./pages/Analysis";
-import Navbar from "./components/Navbar";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import TerminalPage from "./pages/TerminalPage";
 
 function App() {
-    return (
-        <BrowserRouter>
-            <Navbar />
-            <Routes>
-                <Route path="/" element={<Prediction />} />
-                <Route path="/prediction" element={<Prediction />} />
-                <Route path="/analysis" element={<Analysis />} />
-            </Routes>
-        </BrowserRouter>
-    );
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<TerminalPage />} />
+        <Route path="/terminal" element={<TerminalPage />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
 
 export default App;

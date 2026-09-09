@@ -1,18 +1,26 @@
 import axios from "axios";
 
 const API = axios.create({
-  baseURL: "http://localhost:5000"
+  baseURL: "http://localhost:5000",
 });
 
 /**
- * Run a stock price prediction.
- * @param {string} symbol   - NSE ticker symbol (e.g. "RELIANCE")
- * @param {string} model    - "lstm" | "lr" | "rf"
- * @param {number} alpha    - Sentiment influence strength (0.0 – 0.10). Default: 0.02
- * @param {boolean} fastMode - If true, skips LSTM and uses LR for speed
+ * Fetch technical indicators analysis data.
  */
-export const predictStock = (symbol, model = "lstm", fastMode = false) =>
-  API.post("/predict", { symbol, model, fast_mode: fastMode });
-
 export const getAnalysis = (symbol) =>
-  API.post("/analysis", { symbol });
+  API.post("/analysis", { symbol });
+
+/**
+ * Synchronously execute the TickerSense LangGraph agent pipeline.
+ */
+export const runAgent = (symbol) =>
+  API.post("/agent/analyze", { symbol });
+
+/**
+ * Create an EventSource for streaming live agent execution steps.
+ */
+export const createAgentEventSource = (symbol) => {
+  return new EventSource(`http://localhost:5000/agent/stream?symbol=${encodeURIComponent(symbol)}`);
+};
+
+export default API;

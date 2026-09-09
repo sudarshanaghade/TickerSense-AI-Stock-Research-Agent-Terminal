@@ -1,269 +1,318 @@
 """
-app.py — Flask API for Stock Price Prediction + Sentiment Fusion.
+app.py — FastAPI Server for Stock Price Prediction + TickerSense LangGraph Multi-Agent Research.
 
 Endpoints:
-  POST /predict   — ML price forecast + sentiment-adjusted hybrid predictions
-  POST /analysis  — Technical indicators (MA50, MA200, RSI, MACD)
-
-Features:
-  - Three ML models: lstm | lr | rf
-  - Fast Mode: lr/rf only (skips LSTM training, ~10x faster)
-  - Sentiment adjustment: compound * 10 added to predictions
-  - In-memory prediction cache with 5-minute TTL
-  - IST-aware market status (NSE: 09:15–15:30)
+  GET  /              — Server status & IST market status
+  POST /predict       — ML price forecast (LSTM / LR / RF) + sentiment adjustment
+  POST /analysis      — Technical indicators (MA50, MA200, RSI, MACD) chart data
+  POST /agent/analyze — Complete TickerSense LangGraph agent pipeline execution
+  GET  /agent/stream  — Server-Sent Events (SSE) live step-by-step agent execution
 """
 
+import os
 import time
+import json
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import yfinance as yf
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from model import train_lstm, predict_next_days, train_and_predict_lr, train_and_predict_rf
 from indicators import add_indicators
 from sentiment import get_sentiment
+from agent import agent_graph, run_agent_pipeline, resolve_ticker_symbol
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  App setup
+#  FastAPI Setup
 # ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="TickerSense API",
+    description="Full-stack AI Stock Research Agent powered by LangGraph & Groq",
+    version="2.0.0",
+)
 
-app = Flask(__name__)
-CORS(app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Helpers
+#  Helpers & Cache
 # ─────────────────────────────────────────────────────────────────────────────
-
-# IST = UTC + 5:30
 IST = timezone(timedelta(hours=5, minutes=30))
+_CACHE: dict = {}
+_CACHE_TTL = 300  # 5 minutes
 
-def _market_status() -> dict:
-    """Return NSE market open/closed status based on current IST time."""
-    now_ist  = datetime.now(IST)
-    weekday  = now_ist.weekday()          # 0 = Monday … 6 = Sunday
-    hh, mm   = now_ist.hour, now_ist.minute
-    minutes  = hh * 60 + mm
-    is_open  = (
-        weekday < 5                       # Mon–Fri only
-        and 9 * 60 + 15 <= minutes <= 15 * 60 + 30
-    )
+def market_status() -> dict:
+    now_ist = datetime.now(IST)
+    weekday = now_ist.weekday()
+    minutes = now_ist.hour * 60 + now_ist.minute
+    is_open = (weekday < 5) and (9 * 60 + 15 <= minutes <= 15 * 60 + 30)
     return {
-        "open":  is_open,
+        "open": is_open,
         "label": "Market Open" if is_open else "Market Closed",
-        "time":  now_ist.strftime("%H:%M IST"),
+        "time": now_ist.strftime("%H:%M IST"),
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  In-memory prediction cache  (TTL: 5 minutes)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CACHE: dict = {}          # key → {"ts": float, "predictions": list}
-_CACHE_TTL   = 5 * 60      # 300 seconds
-
-
-def _cache_get(key: str):
+def cache_get(key: str):
     entry = _CACHE.get(key)
     if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
         return entry["value"]
     return None
 
-
-def _cache_set(key: str, value):
+def cache_set(key: str, value):
     _CACHE[key] = {"ts": time.time(), "value": value}
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Pydantic Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+class PredictRequest(BaseModel):
+    symbol: str
+    model: str = "lstm"
+    fast_mode: bool = False
+
+class AnalysisRequest(BaseModel):
+    symbol: str
+
+class AgentRequest(BaseModel):
+    symbol: str
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  /predict
+#  Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+def read_root():
+    return {
+        "status": "online",
+        "service": "TickerSense FastAPI Backend",
+        "market_status": market_status(),
+        "groq_api_key_configured": bool(os.getenv("GROQ_API_KEY")),
+    }
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    data        = request.get_json() or {}
-    symbol      = (data.get("symbol") or "").strip().upper()
-    model_type  = data.get("model", "lstm").lower()
-    fast_mode   = bool(data.get("fast_mode", False))
-    days        = 10  # number of days to forecast
+@app.post("/predict")
+def predict(req: PredictRequest):
+    raw_symbol = req.symbol.strip()
+    model_type = req.model.lower()
+    fast_mode = req.fast_mode
+    days = 10
 
-    if not symbol:
-        return jsonify({"error": "Symbol is required"}), 400
+    if not raw_symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
 
-    # Fast mode forces a quick model (lr is fastest, then rf)
+    resolved_ticker = resolve_ticker_symbol(raw_symbol)
+
     if fast_mode and model_type == "lstm":
         model_type = "lr"
-        logger.info("Fast mode active — switching to Linear Regression for %s.", symbol)
+        logger.info("Fast mode active — switching to Linear Regression for %s.", resolved_ticker)
 
+    df = pd.DataFrame()
     try:
-        # ── Fetch historical data (auto-detect exchange) ──────────────────────
-        # Try the symbol as-is first (works for US stocks, crypto, etc.),
-        # then fall back to .NS (NSE India) and .BO (BSE India).
-        df = pd.DataFrame()
-        resolved_ticker = symbol
-        for suffix in ["", ".NS", ".BO"]:
-            candidate = f"{symbol}{suffix}"
-            try:
-                ticker = yf.Ticker(candidate)
-                _df    = ticker.history(period="1y")
-                if isinstance(_df.columns, pd.MultiIndex):
-                    _df.columns = _df.columns.get_level_values(0)
-                if not _df.empty and len(_df) >= 60:
-                    df = _df
-                    resolved_ticker = candidate
-                    logger.info("Resolved %s → %s (%d rows)", symbol, candidate, len(df))
-                    break
-            except Exception as fetch_err:
-                logger.debug("Ticker %s failed: %s", candidate, fetch_err)
+        ticker = yf.Ticker(resolved_ticker)
+        _df = ticker.history(period="1y")
+        if isinstance(_df.columns, pd.MultiIndex):
+            _df.columns = _df.columns.get_level_values(0)
+        if not _df.empty and len(_df) >= 30:
+            df = _df
+    except Exception as fetch_err:
+        logger.debug("Ticker %s failed: %s", resolved_ticker, fetch_err)
 
-        if df.empty or len(df) < 60:
-            return jsonify({
-                "error": f"Insufficient data for '{symbol}'. "
-                         f"Check the ticker symbol and try again (e.g. RELIANCE, TCS, AAPL)."
-            }), 400
+    if df.empty or len(df) < 30:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient price history for ticker '{raw_symbol}' (resolved as '{resolved_ticker}'). Please check symbol validity."
+        )
 
-        current_price = float(df["Close"].squeeze().iloc[-1])
+    current_price = float(df["Close"].squeeze().iloc[-1])
 
-        # ── Step 1: ML Price Prediction (with cache) ──────────────────────────
-        cache_key      = f"{resolved_ticker}:{model_type}"
-        ml_predictions = _cache_get(cache_key)
+    cache_key = f"{resolved_ticker}:{model_type}"
+    ml_predictions = cache_get(cache_key)
 
-        if ml_predictions is None:
-            logger.info("Cache miss — training %s for %s.", model_type, resolved_ticker)
-            if model_type == "lstm":
-                model, scaler = train_lstm(df)
-                ml_predictions = predict_next_days(model, scaler, df, days=days).tolist()
-            elif model_type == "lr":
-                ml_predictions = train_and_predict_lr(df, days=days).tolist()
-            elif model_type == "rf":
-                ml_predictions = train_and_predict_rf(df, days=days).tolist()
-            else:
-                return jsonify({"error": f"Unknown model: {model_type}"}), 400
-            _cache_set(cache_key, ml_predictions)
+    if ml_predictions is None:
+        logger.info("Cache miss — training %s for %s.", model_type, resolved_ticker)
+        if model_type == "lstm":
+            model, scaler = train_lstm(df)
+            ml_predictions = predict_next_days(model, scaler, df, days=days).tolist()
+        elif model_type == "lr":
+            ml_predictions = train_and_predict_lr(df, days=days).tolist()
+        elif model_type == "rf":
+            ml_predictions = train_and_predict_rf(df, days=days).tolist()
         else:
-            logger.info("Cache hit for %s:%s.", resolved_ticker, model_type)
+            raise HTTPException(status_code=400, detail=f"Unknown model: {model_type}")
+        cache_set(cache_key, ml_predictions)
 
-        # ── Step 2: News Sentiment Analysis ──────────────────────────────────
-        sentiment_result = get_sentiment(symbol)
-        summary          = sentiment_result["summary"]
-        compound         = summary["avg_compound"]   # range: -1.0 to +1.0
+    clean_sym = resolved_ticker.replace(".NS", "").replace(".BO", "")
+    sentiment_data = get_sentiment(clean_sym)
+    compound = sentiment_data["summary"]["avg_compound"]
+    adj = round(compound * 10, 2)
+    adjusted_predictions = [round(p + adj, 2) for p in ml_predictions]
 
-        # ── Step 3: Hybrid Fusion ─────────────────────────────────────────────
-        # Simple sentiment adjustment: sentiment_score * 10 added to predictions
-        sentiment_adjustment = compound * 10
-        hybrid_predictions = [
-            round(price + sentiment_adjustment, 2)
-            for price in ml_predictions
-        ]
+    hist_series = []
+    for idx, row in df.tail(60).iterrows():
+        d_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+        hist_series.append({"date": d_str, "close": round(float(row["Close"]), 2)})
 
-        # Sentiment impact in absolute terms (Day 10 hybrid vs ML-only)
-        sentiment_impact_rs = round(
-            hybrid_predictions[-1] - ml_predictions[-1], 2
-        ) if days > 0 else 0.0
+    last_date = df.index[-1]
+    if isinstance(last_date, str):
+        last_date = pd.to_datetime(last_date)
+    future_dates = [(last_date + pd.Timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(days)]
 
-        return jsonify({
-            "symbol":              symbol,
-            "resolved_ticker":     resolved_ticker,
-            "model":               model_type.upper(),
-            "fast_mode":           fast_mode,
-            "current_price":       current_price,
-            "market_status":       _market_status(),
-            "predictions":         [round(p, 2) for p in ml_predictions],
-            "hybrid_predictions":  hybrid_predictions,
-            "sentiment_impact_rs": sentiment_impact_rs,
-            "sentiment": {
-                "avg_compound":   round(compound, 4),
-                "overall_label":  summary["overall_label"],
-                "positive_count": summary["positive_count"],
-                "negative_count": summary["negative_count"],
-                "neutral_count":  summary["neutral_count"],
-                "total":          summary["total"],
-                "source":         summary.get("source", "Unknown"),
-            },
+    forecast_series = []
+    for d, raw_p, adj_p in zip(future_dates, ml_predictions, adjusted_predictions):
+        forecast_series.append({
+            "date": d,
+            "raw_pred": round(float(raw_p), 2),
+            "adj_pred": round(float(adj_p), 2),
         })
 
-    except Exception as exc:
-        logger.error("Error in /predict: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+    return {
+        "symbol": resolved_ticker,
+        "query": raw_symbol,
+        "current_price": round(current_price, 2),
+        "model_used": model_type,
+        "sentiment_adjustment": adj,
+        "sentiment_summary": sentiment_data["summary"],
+        "historical": hist_series,
+        "forecast": forecast_series,
+        "market_status": market_status(),
+    }
 
+@app.post("/analysis")
+def analysis(req: AnalysisRequest):
+    raw_symbol = req.symbol.strip()
+    if not raw_symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /analysis
-# ─────────────────────────────────────────────────────────────────────────────
+    resolved_ticker = resolve_ticker_symbol(raw_symbol)
 
-@app.route("/analysis", methods=["POST"])
-def analysis():
-    data   = request.get_json() or {}
-    symbol = (data.get("symbol") or "").strip().upper()
-
-    if not symbol:
-        return jsonify({"error": "Symbol is required"}), 400
-
+    df = pd.DataFrame()
     try:
-        # Auto-detect exchange (same logic as /predict)
-        df = pd.DataFrame()
-        for suffix in ["", ".NS", ".BO"]:
-            candidate = f"{symbol}{suffix}"
-            try:
-                ticker = yf.Ticker(candidate)
-                _df    = ticker.history(period="1y")
-                if isinstance(_df.columns, pd.MultiIndex):
-                    _df.columns = _df.columns.get_level_values(0)
-                if not _df.empty and len(_df) >= 200:
-                    df = _df
-                    break
-            except Exception:
-                pass
+        ticker = yf.Ticker(resolved_ticker)
+        _df = ticker.history(period="1y")
+        if isinstance(_df.columns, pd.MultiIndex):
+            _df.columns = _df.columns.get_level_values(0)
+        if not _df.empty and len(_df) >= 30:
+            df = _df
+    except Exception as err:
+        logger.debug("Fetch error %s: %s", resolved_ticker, err)
 
-        if df.empty or len(df) < 200:
-            return jsonify({
-                "error": f"Insufficient data for {symbol}. Need at least 200 trading days."
-            }), 400
+    if df.empty:
+        raise HTTPException(status_code=400, detail=f"No price history found for '{raw_symbol}' (resolved as '{resolved_ticker}').")
 
-        df  = add_indicators(df)
-        row = df.iloc[-1]
-
-        return jsonify({
-            "symbol": symbol,
-            "MA50":   float(row["MA50"])   if pd.notna(row["MA50"])   else None,
-            "MA200":  float(row["MA200"])  if pd.notna(row["MA200"])  else None,
-            "RSI":    float(row["RSI"])    if pd.notna(row["RSI"])    else None,
-            "MACD":   float(row["MACD"])   if pd.notna(row["MACD"])   else None,
+    df_ind = add_indicators(df.copy())
+    chart_points = []
+    for idx, row in df_ind.tail(120).iterrows():
+        d_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+        chart_points.append({
+            "date": d_str,
+            "close": round(float(row["Close"]), 2) if pd.notna(row["Close"]) else None,
+            "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else 0,
+            "ma50": round(float(row["MA50"]), 2) if "MA50" in row and pd.notna(row["MA50"]) else None,
+            "ma200": round(float(row["MA200"]), 2) if "MA200" in row and pd.notna(row["MA200"]) else None,
+            "rsi": round(float(row["RSI"]), 2) if "RSI" in row and pd.notna(row["RSI"]) else None,
+            "macd": round(float(row["MACD"]), 4) if "MACD" in row and pd.notna(row["MACD"]) else None,
+            "macd_signal": round(float(row["MACD_SIGNAL"]), 4) if "MACD_SIGNAL" in row and pd.notna(row["MACD_SIGNAL"]) else None,
         })
 
-    except Exception as exc:
-        logger.error("Error in /analysis: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+    return {
+        "symbol": resolved_ticker,
+        "query": raw_symbol,
+        "data_points": len(chart_points),
+        "chart_series": chart_points,
+    }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  /sentiment
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.route("/sentiment", methods=["POST"])
-def sentiment():
-    data   = request.get_json() or {}
-    symbol = (data.get("symbol") or "").strip().upper()
-
+@app.post("/agent/analyze")
+def agent_analyze(req: AgentRequest):
+    symbol = req.symbol.strip()
     if not symbol:
-        return jsonify({"error": "Symbol is required"}), 400
+        raise HTTPException(status_code=400, detail="Symbol is required")
 
-    try:
-        result = get_sentiment(symbol)
-        return jsonify({"symbol": symbol, **result})
-    except Exception as exc:
-        logger.error("Error in /sentiment: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+    logger.info("Executing TickerSense LangGraph agent pipeline for '%s'...", symbol)
+    result = run_agent_pipeline(symbol)
+    
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
 
+    return {
+        "symbol": result.get("resolved_ticker", symbol),
+        "price_data": result.get("price_data"),
+        "chart_series": result.get("chart_series", []),
+        "headlines": result.get("headlines", []),
+        "technical_signals": result.get("technical_signals"),
+        "sentiment_analysis": result.get("sentiment_analysis"),
+        "catalyst_breakdown": result.get("catalyst_breakdown"),
+        "step_logs": result.get("step_logs", []),
+    }
 
-# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/agent/stream")
+async def agent_stream(symbol: str = Query(..., description="Ticker symbol or query to analyze")):
+    clean_symbol = symbol.strip()
+    if not clean_symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    async def event_generator():
+        initial_state = {
+            "symbol": clean_symbol,
+            "resolved_ticker": clean_symbol,
+            "price_data": None,
+            "chart_series": [],
+            "headlines": [],
+            "technical_signals": None,
+            "sentiment_analysis": None,
+            "catalyst_breakdown": None,
+            "step_logs": [],
+            "error": None,
+        }
+
+        try:
+            yield f"event: start\ndata: {json.dumps({'symbol': clean_symbol, 'message': 'Agent pipeline initialized'})}\n\n"
+            await asyncio.sleep(0.05)
+
+            for output in agent_graph.stream(initial_state):
+                for node_name, node_state in output.items():
+                    step_logs = node_state.get("step_logs", [])
+                    latest_log = step_logs[-1] if step_logs else {}
+                    
+                    event_payload = {
+                        "node": node_name,
+                        "log": latest_log,
+                        "state_snapshot": {
+                            "resolved_ticker": node_state.get("resolved_ticker"),
+                            "price_data": node_state.get("price_data"),
+                            "technical_signals": node_state.get("technical_signals"),
+                            "sentiment_analysis": node_state.get("sentiment_analysis"),
+                            "catalyst_breakdown": node_state.get("catalyst_breakdown"),
+                        }
+                    }
+                    yield f"event: step\ndata: {json.dumps(event_payload)}\n\n"
+                    await asyncio.sleep(0.1)
+
+            final_res = run_agent_pipeline(clean_symbol)
+            yield f"event: complete\ndata: {json.dumps(final_res)}\n\n"
+
+        except Exception as exc:
+            logger.error("SSE stream error for %s: %s", clean_symbol, exc)
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
